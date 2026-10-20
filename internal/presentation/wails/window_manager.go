@@ -55,6 +55,10 @@ type WindowManager struct {
 	settingsBoundsReady  atomic.Bool
 	mainHTMLSurfaceReady atomic.Bool
 	mainBootFallback     atomic.Bool
+	mainRuntimeReady     atomic.Bool
+
+	pendingMainBackground   func()
+	pendingMainBackgroundMu sync.Mutex
 
 	systemTray *SystemTrayController
 }
@@ -1004,10 +1008,12 @@ func (manager *WindowManager) ApplySettings(current dto.Settings) {
 			color,
 		)
 		manager.syncWindowPresentation(current)
-		manager.mainWindow.SetBackgroundColour(backgrounds.main)
-		// The native video host remains an opaque content plane. Settings reveals
-		// its preinstalled underlay only while the window-wide style is Glass.
-		syncListenNativeVideoHostBackground(manager.mainWindow, color)
+		manager.applyMainWindowBackground(func() {
+			manager.mainWindow.SetBackgroundColour(backgrounds.main)
+			// The native video host remains an opaque content plane. Settings reveals
+			// its preinstalled underlay only while the window-wide style is Glass.
+			syncListenNativeVideoHostBackground(manager.mainWindow, color)
+		})
 		if settingsWindow != nil {
 			settingsWindow.SetBackgroundColour(settingsBackground)
 		}
@@ -1023,6 +1029,49 @@ func (manager *WindowManager) ApplySettings(current dto.Settings) {
 	}
 
 	apply()
+}
+
+// applyMainWindowBackground defers WebView background mutations until the main
+// window runtime has finished embedding its WebView2 controller. Calling
+// SetBackgroundColour earlier races with setupChromium on Windows: the
+// InvokeSync callback runs re-entrantly inside Embed and dereferences a nil
+// controller, which aborts window creation and leaves the process running
+// without any window. Only the latest pending closure is kept because older
+// background values are obsolete by the time the runtime becomes ready.
+func (manager *WindowManager) applyMainWindowBackground(apply func()) {
+	if manager == nil || apply == nil {
+		return
+	}
+	if manager.mainRuntimeReady.Load() {
+		apply()
+		return
+	}
+	manager.pendingMainBackgroundMu.Lock()
+	manager.pendingMainBackground = apply
+	manager.pendingMainBackgroundMu.Unlock()
+}
+
+// flushPendingMainWindowBackground marks the main window runtime ready and
+// applies the background closure deferred by applyMainWindowBackground. It is
+// called from the WindowRuntimeReady handler, which only fires after the
+// WebView2 controller has been embedded.
+func (manager *WindowManager) flushPendingMainWindowBackground() {
+	if manager == nil {
+		return
+	}
+	manager.mainRuntimeReady.Store(true)
+	manager.pendingMainBackgroundMu.Lock()
+	pending := manager.pendingMainBackground
+	manager.pendingMainBackground = nil
+	manager.pendingMainBackgroundMu.Unlock()
+	if pending == nil {
+		return
+	}
+	if manager.canInvokeSync() {
+		application.InvokeSync(pending)
+		return
+	}
+	pending()
 }
 
 func (manager *WindowManager) dispatchWindowEvent(name string, data any) {
@@ -1066,6 +1115,7 @@ func (manager *WindowManager) registerMainWindowEvents() {
 	mainDebounce := debounce.New(600 * time.Millisecond)
 
 	manager.mainWindow.OnWindowEvent(events.Common.WindowRuntimeReady, func(_ *application.WindowEvent) {
+		manager.flushPendingMainWindowBackground()
 		manager.restoreCachedBounds(windowTypeMain)
 		manager.ensureWindowVisible(windowTypeMain)
 		manager.markBoundsTrackingReady(windowTypeMain)
